@@ -1,0 +1,7 @@
+# Example ~/.calclirc
+[account myname]
+# Usernames and passwords are read from ~/.netrc. See netrc(5)
+server = myserver.org
+# Defaults to true. Set to false if you have not set certificates up properly.
+# letsencrypt may help.
+# verify_ssl = true

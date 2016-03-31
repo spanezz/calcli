@@ -1,0 +1,282 @@
+#!/usr/bin/python3
+
+import easywebdav
+import netrc
+import vobject
+import os
+import re
+import datetime
+import calendar
+import dateutil.parser
+import argparse
+import pytz
+import tzlocal
+import sys
+import configparser
+import logging
+
+log = logging.getLogger("calcli")
+tz = tzlocal.get_localzone()
+
+class DTRange:
+    re_day = re.compile(R"^\d{1,2}$")
+    re_monthday = re.compile(R"^\d{1,2}-\d{1,2}$")
+    re_yearmonth = re.compile(R"^\d{4}-\d{1,2}$")
+    re_ymd = re.compile(R"\d{4}-\d{1,2}-\d{1,2}$")
+
+    def __init__(self, since=None, until=None):
+        """
+        Datetime range. None in one extreme means open ended.
+        """
+        self.since = since
+        self.until = until
+
+    def match(self, evt):
+        since, until = evt.since, evt.until
+        if until is None: until = since
+        if self.since is not None and until < self.since: return False
+        if self.until is not None and since > self.until: return None
+        return True
+
+    @classmethod
+    def parse_range(cls, arg):
+        if cls.re_day.match(arg):
+            # DD
+            date = datetime.date.today().replace(day=int(arg))
+            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
+                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
+        elif cls.re_monthday.match(arg):
+            # MM-DD
+            month, day = (int(x) for x in arg.split("-"))
+            date = datetime.date.today().replace(month=month, day=day)
+            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
+                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
+        elif cls.re_yearmonth.match(arg):
+            # YYYY-MM
+            year, month = (int(x) for x in arg.split("-"))
+            return (datetime.datetime(year, month, 1, 0, 0, 0).replace(tzinfo=tz),
+                    datetime.datetime(year, month, calendar.monthrange(year, month)[1], 23, 59, 59).replace(tzinfo=tz))
+        elif cls.re_ymd.match(arg):
+            # YYYY-MM-DD
+            date = datetime.date(*(int(x) for x in arg.split("-")))
+            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
+                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
+        else:
+            raise RuntimeError("No fallback to dateutils.parse implemented yet")
+
+
+
+class Filter:
+    def __init__(self, args):
+        self.filters = []
+        for a in args:
+            if a.startswith("since:"):
+                # since:<dt>
+                since, until = DTRange.parse_range(a[6:])
+                self.filters.append(DTRange(since=since))
+            elif a.startswith("until:"):
+                # until:<dt>
+                since, until = DTRange.parse_range(a[6:])
+                self.filters.append(DTRange(until=until))
+            else:
+                since, until = DTRange.parse_range(a)
+                self.filters.append(DTRange(since, until))
+
+    def match(self, evt):
+        for f in self.filters:
+            if not f.match(evt): return False
+        return True
+
+
+class Event:
+    def __init__(self, evt):
+        self.evt = evt
+        self.since, self.until = self.dtrange()
+
+    def dtrange(self):
+        """
+        Return (since, until) with datetime or None of the beginning and end
+        instants for an event.
+        """
+        since = self.evt.dtstart.value
+        until = None
+        # TODO: pick default timezones from ical
+        if hasattr(self.evt, "dtend"):
+            until = self.evt.dtend.value
+        if hasattr(since, "date"):
+            if since and since.tzinfo is None: since = since.replace(tzinfo=tz)
+            if until and until.tzinfo is None: until = until.replace(tzinfo=tz)
+            return since, until
+        else:
+            return datetime.datetime.combine(since, datetime.time(0, 0, 0)).replace(tzinfo=tz), datetime.datetime.combine(until, datetime.time(23, 59, 59)).replace(tzinfo=tz)
+
+
+    def print_line(self, file=None):
+        since = self.evt.dtstart.value
+        until = None
+        if hasattr(self.evt, "dtend"):
+            until = self.evt.dtend.value
+        summary = self.evt.summary.value
+        if hasattr(since, "date"):
+            if until is None:
+                print("{day} {since:%H:%M}: {summary}".format(
+                    day=since.date(),
+                    since=since.time(),
+                    summary=summary), file=file)
+            elif since.date() == until.date():
+                print("{day} {since:%H:%M}-{until:%H:%M}: {summary}".format(
+                    day=since.date(),
+                    since=since.time(),
+                    until=until.time(),
+                    summary=summary), file=file)
+            else:
+                print("{since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M}: {summary}".format(
+                    since=since,
+                    until=until,
+                    summary=summary), file=file)
+        else:
+            if since == until:
+                print("{day}: {summary}".format(day=since, summary=summary), file=file)
+            else:
+                print("{since:%Y-%m-%d} to {until:%Y-%m-%d}: {summary}".format(
+                    since=since,
+                    until=until,
+                    summary=summary), file=file)
+
+
+class Events:
+    def __init__(self, accounts):
+        self.accounts = accounts
+        self.events = []
+
+    def load(self):
+        for a in self.accounts:
+            for root, dirs, fnames in os.walk(os.path.join(os.path.expanduser("~/.calcli"), a.name)):
+                for fn in fnames:
+                    if fn.endswith(".ics"):
+                        self.load_file(a, os.path.join(root, fn))
+
+        self.events.sort(key=lambda x:(x.since, x.until))
+
+    def load_file(self, account, pathname):
+        log.info("Loading %s", pathname)
+        with open(pathname, "rt") as fd:
+            z = vobject.readOne(fd)
+            for evt in z.vevent_list:
+                # TODO: add account/calendar name to Event
+                self.events.append(Event(evt))
+
+
+class Command:
+    def __init__(self, filter_args, args):
+        self.filter_args = filter_args
+        self.args = args
+
+    @classmethod
+    def get_name(cls):
+        return cls.__name__.lower()
+
+
+class Next(Command):
+    def run(self, events):
+        self.flt = Filter(self.filter_args)
+        events.load()
+        for e in events.events:
+            if not self.flt.match(e): continue
+            e.print_line()
+
+
+class Update(Command):
+    def run(self, events):
+        for a in events.accounts:
+            a.update()
+
+
+def make_command(commands, args):
+    filter_args = []
+    command = None
+    cmd_args = []
+    for a in args.args:
+        if command is None:
+            for c in commands:
+                if c.get_name() == a:
+                    command = c
+                    break
+            else:
+                filter_args.append(a)
+        else:
+            cmd_args.append(a)
+
+    if command is None:
+        return Next(filter_args, [])
+    else:
+        return command(filter_args, cmd_args)
+
+
+class Account:
+    def __init__(self, config, secname):
+        self.name = secname.split(None, 1)[1]
+        self.server = config.get(secname, "server", fallback=None)
+        self.verify_ssl = config.getboolean(secname, "verify_ssl", fallback=True)
+
+    def update(self):
+        log.info("Update account %s on %s", self.name, self.server)
+        nrc = netrc.netrc()
+        login, accoun, password = nrc.hosts[self.server]
+        webdav = easywebdav.connect(self.server, protocol="https", verify_ssl=self.verify_ssl, username=login, password=password)
+        self.scan_webdav(webdav, "/")
+
+    def scan_webdav(self, webdav, root):
+        log.debug("Scanning %s %s", webdav.baseurl, root)
+        for f in webdav.ls(root):
+            fn = os.path.relpath(f.name, root)
+            if fn.startswith("."): continue
+            if f.contenttype != "text/calendar": continue
+            if fn.endswith(".ics"):
+                out_dirname = os.path.join(os.path.expanduser("~/.calcli"), self.name, root.lstrip("/"))
+                out_pathname = os.path.join(out_dirname, fn)
+                os.makedirs(out_dirname, exist_ok=True)
+                webdav.download(f.name, out_pathname)
+            else:
+                self.scan_webdav(webdav, os.path.join(root, fn) + "/")
+
+
+def make_accounts(config):
+    for s in config.sections():
+        if s.startswith("account "):
+            yield Account(config, s)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Command line calendar tool.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
+    parser.add_argument("--debug", action="store_true", help="verbose output")
+    parser.add_argument("args", nargs="*", help="[filter] command [args]")
+    args = parser.parse_args()
+
+    FORMAT = "%(asctime)-15s %(levelname)s %(message)s"
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr, format=FORMAT)
+    elif args.verbose:
+        logging.basicConfig(level=logging.INFO, stream=sys.stderr, format=FORMAT)
+    else:
+        logging.basicConfig(level=logging.WARN, stream=sys.stderr, format=FORMAT)
+
+    config = configparser.ConfigParser()
+    config.read(os.path.expanduser("~/.calclirc"))
+
+    accounts = list(make_accounts(config))
+
+    events = Events(accounts)
+
+    commands = [
+        Next,
+        Update,
+    ]
+
+    cmd = make_command(commands, args)
+    cmd.run(events)
+
+
+if __name__ == "__main__":
+    main()
