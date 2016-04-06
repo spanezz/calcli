@@ -18,110 +18,150 @@ import logging
 log = logging.getLogger("calcli")
 tz = tzlocal.get_localzone()
 
-class DTRange:
-    re_day = re.compile(R"^\d{1,2}$")
-    re_monthday = re.compile(R"^\d{1,2}-\d{1,2}$")
-    re_yearmonth = re.compile(R"^\d{4}-\d{1,2}$")
-    re_ymd = re.compile(R"\d{4}-\d{1,2}-\d{1,2}$")
-
-    def __init__(self, since=None, until=None):
-        """
-        Datetime range. None in one extreme means open ended.
-        """
-        self.since = since
-        self.until = until
-
-    def match(self, evt):
-        since, until = evt.since, evt.until
-        if until is None: until = since
-        if self.since is not None and until < self.since: return False
-        if self.until is not None and since > self.until: return None
-        return True
-
-    @classmethod
-    def parse_range(cls, arg):
-        if cls.re_day.match(arg):
-            # DD
-            date = datetime.date.today().replace(day=int(arg))
-            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
-                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
-        elif cls.re_monthday.match(arg):
-            # MM-DD
-            month, day = (int(x) for x in arg.split("-"))
-            date = datetime.date.today().replace(month=month, day=day)
-            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
-                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
-        elif cls.re_yearmonth.match(arg):
-            # YYYY-MM
-            year, month = (int(x) for x in arg.split("-"))
-            return (datetime.datetime(year, month, 1, 0, 0, 0).replace(tzinfo=tz),
-                    datetime.datetime(year, month, calendar.monthrange(year, month)[1], 23, 59, 59).replace(tzinfo=tz))
-        elif cls.re_ymd.match(arg):
-            # YYYY-MM-DD
-            date = datetime.date(*(int(x) for x in arg.split("-")))
-            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
-                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
-        else:
-            raise RuntimeError("No fallback to dateutils.parse implemented yet")
-
-
 
 class Filter:
-    def __init__(self, args):
-        self.filters = []
-        for a in args:
-            if a.startswith("since:"):
-                # since:<dt>
-                since, until = DTRange.parse_range(a[6:])
-                self.filters.append(DTRange(since=since))
-            elif a.startswith("until:"):
-                # until:<dt>
-                since, until = DTRange.parse_range(a[6:])
-                self.filters.append(DTRange(until=until))
-            else:
-                since, until = DTRange.parse_range(a)
-                self.filters.append(DTRange(since, until))
+    def __init__(self, engine):
+        self.engine = engine
 
-    def match(self, evt):
-        for f in self.filters:
-            if not f.match(evt): return False
+#    def __init__(self, args):
+#        self.filters = []
+#        for a in args:
+#            if a.startswith("since:"):
+#                # since:<dt>
+#                since, until = DTRange.parse_range(a[6:])
+#                self.filters.append(DTRange(since=since))
+#            elif a.startswith("until:"):
+#                # until:<dt>
+#                since, until = DTRange.parse_range(a[6:])
+#                self.filters.append(DTRange(until=until))
+#            else:
+#                since, until = DTRange.parse_range(a)
+#                self.filters.append(DTRange(since, until))
+
+    def filter(self, event):
+        """
+        By default, accept all events
+        """
         return True
 
+    def events(self):
+        """
+        Generate all the events matched by this filter
+        """
+        for e in self.generate():
+            if not self.filter(e): continue
+            yield e
 
-def print_event(evt, file=None):
-    summary = evt.summary
-    if evt.allday:
-        since = evt.start
-        until = evt.end
-        if since == until:
-            print("{day}: {summary}".format(day=since, summary=summary), file=file)
+    @classmethod
+    def parse_args(cls, engine, args):
+        res = []
+        for a in args:
+            f = cls.parse(engine, a)
+            if f is None: continue
+            res.append(f)
+
+        if not res:
+            return None
+        elif len(res) == 1:
+            return res[0]
         else:
-            print("{since:%Y-%m-%d} to {until:%Y-%m-%d}: {summary}".format(
-                since=since,
-                until=until,
-                summary=summary), file=file)
-    else:
-        since = evt.start
-        until = evt.end
-        if until is None:
-            print("{day} {since:%H:%M}: {summary}".format(
-                day=since.date(),
-                since=since.time(),
-                summary=summary), file=file)
-        elif since.date() == until.date():
-            print("{day} {since:%H:%M}-{until:%H:%M}: {summary}".format(
-                day=since.date(),
-                since=since.time(),
-                until=until.time(),
-                summary=summary), file=file)
+            return FilterAnd(engine=engine, subfilters=res)
+
+    @classmethod
+    def parse(cls, engine, arg):
+        if arg == "today":
+            return FilterToday(engine=engine)
         else:
-            print("{since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M}: {summary}".format(
-                since=since,
-                until=until,
-                summary=summary), file=file)
+            raise RuntimeError("unparsed filter: {}".format(arg))
 
 
-class Events:
+class FilterDay(Filter):
+    def __init__(self, day, *args, **kw):
+        super().__init__(*args, **kw)
+        self.day = day
+
+    def generate(self):
+        yield from self.engine.collection.get_events_on(self.day)
+
+    def filter(self, event):
+        if event.allday:
+            return event.start <= self.day and event.end >= self.day
+        else:
+            return event.start.date() <= self.day and event.end.date() >= self.day
+
+
+class FilterToday(FilterDay):
+    def __init__(self, *args, **kw):
+        super().__init__(day=datetime.date.today(), *args, **kw)
+
+
+class FilterAnd(Filter):
+    def __init__(self, subfilters, *args, **kw):
+        super().__init__(*args, **kw)
+        self.subfilters = subfilters
+
+    def generate(self):
+        # Generate from the first subfilter that can do it, and let filters
+        # take care of the rest
+        for f in self.subfilters:
+            if not hasattr(f, "generate"): continue
+            yield from f.generate()
+            break
+
+    def filter(self, event):
+        return all(f.filter(event) for f in self.subfilters)
+
+
+#class DTRange:
+#    re_day = re.compile(R"^\d{1,2}$")
+#    re_monthday = re.compile(R"^\d{1,2}-\d{1,2}$")
+#    re_yearmonth = re.compile(R"^\d{4}-\d{1,2}$")
+#    re_ymd = re.compile(R"\d{4}-\d{1,2}-\d{1,2}$")
+#
+#    def __init__(self, since=None, until=None):
+#        """
+#        Datetime range. None in one extreme means open ended.
+#        """
+#        self.since = since
+#        self.until = until
+#
+#    def match(self, evt):
+#        since, until = evt.since, evt.until
+#        if until is None: until = since
+#        if self.since is not None and until < self.since: return False
+#        if self.until is not None and since > self.until: return None
+#        return True
+#
+#    @classmethod
+#    def parse_range(cls, arg):
+#        if cls.re_day.match(arg):
+#            # DD
+#            date = datetime.date.today().replace(day=int(arg))
+#            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
+#                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
+#        elif cls.re_monthday.match(arg):
+#            # MM-DD
+#            month, day = (int(x) for x in arg.split("-"))
+#            date = datetime.date.today().replace(month=month, day=day)
+#            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
+#                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
+#        elif cls.re_yearmonth.match(arg):
+#            # YYYY-MM
+#            year, month = (int(x) for x in arg.split("-"))
+#            return (datetime.datetime(year, month, 1, 0, 0, 0).replace(tzinfo=tz),
+#                    datetime.datetime(year, month, calendar.monthrange(year, month)[1], 23, 59, 59).replace(tzinfo=tz))
+#        elif cls.re_ymd.match(arg):
+#            # YYYY-MM-DD
+#            date = datetime.date(*(int(x) for x in arg.split("-")))
+#            return (datetime.datetime.combine(date, datetime.time(0, 0, 0)).replace(tzinfo=tz),
+#                    datetime.datetime.combine(date, datetime.time(23, 59, 59)).replace(tzinfo=tz))
+#        else:
+#            raise RuntimeError("No fallback to dateutils.parse implemented yet")
+
+
+
+
+class Engine:
     def __init__(self):
         from khal import cli, khalendar
         self.conf = cli.get_config(None)
@@ -146,15 +186,34 @@ class Events:
             highlight_event_days=self.conf['default']['highlight_event_days'],
         )
 
-    @property
-    def events(self):
-        minimal = False
-        now = datetime.datetime.now()
-        begin = now - datetime.timedelta(days=1)
-        until = now + datetime.timedelta(days=10)
-        yield from self.collection.get_floating(begin, until, minimal)
-        localize = self.collection._locale['local_timezone'].localize
-        yield from self.collection.get_localized(localize(begin), localize(until), minimal)
+        self.localize = self.collection._locale['local_timezone'].localize
+
+    def print_event(self, evt, file=None):
+        if evt.allday:
+            if evt.start == evt.end:
+                print("{e.start}: [{e.calendar}] {e.summary}".format(e=evt), file=file)
+            else:
+                print("{e.start:%Y-%m-%d} to {e.end:%Y-%m-%d}: [{e.calendar}] {e.summary}".format(e=evt), file=file)
+        else:
+            since = evt.start_local
+            until = evt.end_local
+            if until is None:
+                print("{day} {since:%H:%M}: [{e.calendar}] {e.summary}".format(
+                    day=since.date(),
+                    since=since.time(),
+                    e=evt), file=file)
+            elif since.date() == until.date():
+                print("{day} {since:%H:%M}-{until:%H:%M}: [{e.calendar}] {e.summary}".format(
+                    day=since.date(),
+                    since=since.time(),
+                    until=until.time(),
+                    e=evt), file=file)
+            else:
+                print("{since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M}: [{e.calendar}] {e.summary}".format(
+                    since=since,
+                    until=until,
+                    e=evt), file=file)
+
 
 
 class Command:
@@ -168,13 +227,11 @@ class Command:
 
 
 class Next(Command):
-    def run(self, events):
-        self.flt = Filter(self.filter_args)
-        #events.load()
-        for e in events.events:
-            #if not self.flt.match(e): continue
-            #e.print_line()
-            print_event(e)
+    def run(self, engine):
+        flt = Filter.parse_args(engine, self.filter_args)
+        if flt is None: flt = FilterToday(engine=engine)
+        for e in flt.events():
+            engine.print_event(e)
 
 
 def make_command(commands, args):
@@ -213,14 +270,14 @@ def main():
     else:
         logging.basicConfig(level=logging.WARN, stream=sys.stderr, format=FORMAT)
 
-    events = Events()
+    engine = Engine()
 
     commands = [
         Next,
     ]
 
     cmd = make_command(commands, args)
-    cmd.run(events)
+    cmd.run(engine)
 
 
 if __name__ == "__main__":
