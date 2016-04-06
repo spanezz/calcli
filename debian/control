@@ -1,0 +1,20 @@
+Source: calcli
+Maintainer: Enrico Zini <enrico@debian.org>
+Section: utils
+Priority: optional
+Build-Depends: debhelper (>= 9),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+	       python3-khal
+Build-Depends-Indep: help2man
+Standards-Version: 3.9.7
+Vcs-Git: https://github.com/spanezz/calcli.git
+Vcs-Browser: https://github.com/spanezz/calcli
+
+Package: calcli
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}
+Description: command line calendar tool with a taskwarrior-like interface
+ Taskwarrior-inspired command line calendar tool built on top of
+ khal's library

@@ -1,3 +1,4 @@
-# calcli: command line CalDAV client
+# calcli: command line calendar tool
 
-Taskwarrior-inspired CalDAV command line tool.
+Taskwarrior-inspired command line calendar tool built on top of
+[khal](http://lostpackets.de/khal/)'s library
